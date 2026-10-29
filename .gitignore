@@ -1,1 +1,8 @@
-DarkSpider/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Default generated crawl output
+links.txt
+edges.json
