@@ -49,14 +49,37 @@ def report(db_path=DB_FILE):
           )
         """
     ).fetchone()[0]
-    average_lifespan = connection.execute(
+    # MAX - MIN across alive observations only proves the service was up across
+    # that span, so it is a lower bound, never a lifespan. A URL seen alive in a
+    # single cycle contributes 0 hours: it was up at one instant, not for zero
+    # time. Reported as a bound, with the two groups that make it a bound.
+    span = connection.execute(
         """
-        SELECT AVG(hours_alive) FROM (
-            SELECT (julianday(MAX(p.timestamp)) - julianday(MIN(p.timestamp))) * 24 AS hours_alive
+        SELECT COUNT(*) AS observed,
+               AVG(hours_alive) AS mean_hours,
+               MAX(hours_alive) AS max_hours,
+               SUM(single_observation) AS single
+        FROM (
+            SELECT (julianday(MAX(p.timestamp)) - julianday(MIN(p.timestamp))) * 24 AS hours_alive,
+                   COUNT(*) = 1 AS single_observation
             FROM pings p JOIN cycles c ON c.cycle_id = p.cycle_id
             WHERE c.status = 'completed' AND p.status = 'alive'
             GROUP BY p.url
         )
+        """
+    ).fetchone()
+    # Right-censored: alive when we last looked, so the true lifespan runs past
+    # the end of the observation window by an unknown amount.
+    censored = connection.execute(
+        """
+        SELECT COUNT(*) FROM pings
+        WHERE status = 'alive'
+          AND cycle_id = (
+              SELECT cycle_id FROM cycles
+              WHERE status = 'completed'
+              ORDER BY datetime(started_at) DESC, cycle_id DESC
+              LIMIT 1
+          )
         """
     ).fetchone()[0]
 
@@ -70,7 +93,15 @@ def report(db_path=DB_FILE):
     print(f"Never responded:           {never_alive} ({percentage(never_alive, total):.1f}%)")
     print(f"Consistently alive:        {always_alive} ({percentage(always_alive, total):.1f}%)")
     print(f"Churned (alive then dead): {churned} ({percentage(churned, total):.1f}%)")
-    print(f"Average observed lifespan: {(average_lifespan or 0):.1f} hours")
+    print(
+        f"Mean observed alive span:  >={(span['mean_hours'] or 0):.1f} hours "
+        f"(LOWER BOUND, n={span['observed']})"
+    )
+    print(f"Longest observed span:     >={(span['max_hours'] or 0):.1f} hours (LOWER BOUND)")
+    print(f"Single-observation URLs:   {span['single'] or 0} (alive in one cycle; span >=0h)")
+    print(f"Right-censored URLs:       {censored} (still alive in latest completed cycle)")
+    print("  Spans are lower bounds: observation starts after a service exists and")
+    print("  ends while it may still be running. No survival model is applied.")
 
     print("\nPer-cycle breakdown:")
     cycles = connection.execute(

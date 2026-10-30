@@ -122,13 +122,21 @@ class AppEntryPointTests(unittest.TestCase):
 
     def test_dashboard_response_is_available(self):
         response = app_module.index()
-        self.assertIn(b"Alive over time", response.body)
+        # Anchor on structure, not heading prose, so a restyle does not fail here.
+        self.assertIn(b'id="chart"', response.body)
+        self.assertIn(b'id="url-body"', response.body)
 
     def test_default_command_starts_server(self):
         with patch("app.parse_args", return_value=argparse.Namespace(command=None)):
             with patch("app.start_server") as start_server:
                 app_module.main()
-        start_server.assert_called_once_with(port=8000, no_pinger=False, interval=app_module.DEFAULT_INTERVAL)
+        start_server.assert_called_once_with(
+            port=8000,
+            no_pinger=False,
+            interval=app_module.DEFAULT_INTERVAL,
+            demo=False,
+            db=None,  # no --db: the served database stays the default
+        )
 
     @patch("app.crawler_module.OnionCrawler")
     @patch("app.check_tor", return_value=(False, "Tor unavailable"))

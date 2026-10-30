@@ -2,11 +2,24 @@ import sqlite3
 from pathlib import Path
 
 
-def connect_db(path):
-    connection = sqlite3.connect(Path(path))
+def connect_db(path, timeout=30):
+    connection = sqlite3.connect(Path(path), timeout=timeout)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    # WAL lets dashboard reads continue while the pinger writes.
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
     return connection
+
+
+def init_db(path):
+    """Create/migrate the schema once, at startup, not on every request."""
+    connection = connect_db(path)
+    ensure_schema(connection)
+    connection.close()
 
 
 def _columns(connection, table):
@@ -107,25 +120,32 @@ def rebuild_url_stats(connection):
         SELECT url, MIN(timestamp) FROM pings GROUP BY url
         """
     )
+    # Build one grouped stats table, then apply it. This avoids running a
+    # correlated subquery three times for every URL.
+    connection.execute("DROP TABLE IF EXISTS temp._url_stats")
+    connection.execute(
+        """
+        CREATE TEMP TABLE _url_stats AS
+        SELECT p.url,
+               COUNT(*) AS total_pings,
+               SUM(CASE WHEN p.status = 'alive' THEN 1 ELSE 0 END) AS alive_pings,
+               MAX(CASE WHEN p.status = 'alive' THEN p.timestamp END) AS last_alive
+        FROM pings p
+        JOIN cycles c ON c.cycle_id = p.cycle_id AND c.status = 'completed'
+        GROUP BY p.url
+        """
+    )
+    connection.execute("CREATE UNIQUE INDEX temp.idx_url_stats ON _url_stats(url)")
+    connection.execute("UPDATE urls SET total_pings = 0, alive_pings = 0, last_alive = NULL")
     connection.execute(
         """
         UPDATE urls
-        SET total_pings = COALESCE((
-                SELECT COUNT(*)
-                FROM pings p JOIN cycles c ON c.cycle_id = p.cycle_id
-                WHERE p.url = urls.url AND c.status = 'completed'
-            ), 0),
-            alive_pings = COALESCE((
-                SELECT COUNT(*)
-                FROM pings p JOIN cycles c ON c.cycle_id = p.cycle_id
-                WHERE p.url = urls.url AND c.status = 'completed'
-                  AND p.status = 'alive'
-            ), 0),
-            last_alive = (
-                SELECT MAX(p.timestamp)
-                FROM pings p JOIN cycles c ON c.cycle_id = p.cycle_id
-                WHERE p.url = urls.url AND c.status = 'completed'
-                  AND p.status = 'alive'
-            )
+        SET total_pings = s.total_pings,
+            alive_pings = s.alive_pings,
+            last_alive = s.last_alive
+        FROM _url_stats s
+        WHERE urls.url = s.url
         """
     )
+    connection.execute("DROP TABLE temp._url_stats")
+    connection.commit()

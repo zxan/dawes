@@ -98,6 +98,21 @@ The pinger begins a cycle as soon as it starts. An interval of `3600` means
 one hour between cycle starts after each cycle finishes. Aborted cycles are
 recorded as gaps rather than as observations that every service was dead.
 
+## Demo mode (no waiting for real cycles)
+
+A real cycle probes thousands of onion services and can take hours. To show a
+fully populated, changing dashboard immediately:
+
+```bash
+python app.py demo                 # seed 12 cycles + 1 gap (backs up the old DB)
+python app.py server --demo --interval 15
+```
+
+`--demo` appends a fast simulated cycle every 15 seconds, so the tiles, chart,
+and churn numbers move while you watch. The UI shows a `DEMO DATA` badge. The
+previous database is preserved as `onions.db.bak-<timestamp>`. Use normal
+`python app.py` for real Tor pings.
+
 ## Run the pinger separately
 
 Run one cycle and exit:

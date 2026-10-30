@@ -1,8 +1,10 @@
 import argparse
 import json
 import logging
+import subprocess
 import threading
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 from typing import Optional
 
@@ -10,8 +12,11 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import crawler as crawler_module
+import pinger as pinger_module
 import report as report_module
-from database import connect_db, ensure_schema
+from database import connect_db, ensure_schema, init_db
+from demo_data import (DEFAULT_URL_COUNT, DEMO_DB_FILE, ensure_demo_data,
+                       seed_demo, simulate_cycle)
 from pinger import default_links_file, load_urls, run_cycle
 from tor_utils import check_tor
 from url_utils import normalize_onion_url
@@ -22,6 +27,7 @@ DB_FILE = "onions.db"
 LINKS_FILE = "links.txt"
 EDGES_FILE = "edges.json"
 DEFAULT_INTERVAL = 6 * 60 * 60
+DEMO_MODE = False
 
 app = FastAPI(title=APP_TITLE)
 
@@ -34,6 +40,7 @@ class PingerManager:
         interval=DEFAULT_INTERVAL,
         timeout=30,
         workers=8,
+        simulate=False,
     ):
         self.db_path = Path(db_path)
         self.links_path = Path(links_path) if links_path else default_links_file()
@@ -42,6 +49,7 @@ class PingerManager:
             raise ValueError("interval must be positive")
         self.timeout = timeout
         self.workers = workers
+        self.simulate = simulate
         self.stop_event = threading.Event()
         self.thread = None
         self.running = False
@@ -59,6 +67,8 @@ class PingerManager:
                 "running": self.running,
                 "urls": self.urls_count,
                 "interval": self.interval,
+                "mode": "demo" if self.simulate else "live",
+                "locked": DEMO_MODE and not self.simulate,
                 "last_cycle": self.last_cycle,
             }
 
@@ -119,9 +129,12 @@ class PingerManager:
                     self.urls_count = len(urls)
 
                 try:
-                    success = run_cycle(
-                        connection, urls, timeout=self.timeout, workers=self.workers
-                    )
+                    if self.simulate:
+                        success = simulate_cycle(connection, urls)
+                    else:
+                        success = run_cycle(
+                            connection, urls, timeout=self.timeout, workers=self.workers
+                        )
                 except Exception:  # pinger already aborts the cycle; keep daemon alive
                     self.log.exception("Pinger cycle error")
                     success = False
@@ -181,15 +194,57 @@ def percentage(part, whole):
     return (part / whole * 100) if whole else 0.0
 
 
+def conflicting_pinger(db_path):
+    """Command line of a pinger.py already writing db_path, if there is one.
+
+    Two pingers on one SQLite file interleave cycles and corrupt the run, so a
+    second one must never be started implicitly. Parsing failures fall back to
+    pinger.py's own default database, which errs toward reporting a conflict.
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-af", "pinger.py"], capture_output=True, text=True, check=False
+        ).stdout
+    except (OSError, ValueError):
+        return None
+    try:
+        target = Path(db_path).resolve()
+    except OSError:
+        return None
+    for line in out.splitlines():
+        if "pinger.py" not in line or "pgrep" in line:
+            continue
+        tokens = line.split()
+        other = pinger_module.DB_FILE
+        for index, token in enumerate(tokens):
+            if token == "--db" and index + 1 < len(tokens):
+                other = tokens[index + 1]
+            elif token.startswith("--db="):
+                other = token.split("=", 1)[1]
+        try:
+            if Path(other).resolve() == target:
+                return line.strip()
+        except OSError:
+            continue
+    return None
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse(_DASHBOARD_HTML)
+    html = _DASHBOARD_HTML.replace(
+        "<!--BANNER-->", _SYNTHETIC_BANNER if DEMO_MODE else ""
+    ).replace("<!--DBNAME-->", escape(Path(DB_FILE).name))
+    return HTMLResponse(html)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "demo": DEMO_MODE}
 
 
 @app.get("/api/summary")
 def summary():
     connection = connect_db(DB_FILE)
-    ensure_schema(connection)
     try:
         total = connection.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
         completed = connection.execute(
@@ -234,6 +289,21 @@ def summary():
               )
             """
         ).fetchone()[0]
+        churned_now = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM urls u
+            JOIN pings p ON p.url = u.url
+            WHERE u.alive_pings > 0
+              AND p.status = 'dead'
+              AND p.cycle_id = (
+                  SELECT cycle_id FROM cycles
+                  WHERE status = 'completed'
+                  ORDER BY datetime(started_at) DESC, cycle_id DESC
+                  LIMIT 1
+              )
+            """
+        ).fetchone()[0]
         last_cycle = connection.execute(
             """
             SELECT started_at, total, alive, status
@@ -258,8 +328,11 @@ def summary():
             "always_alive_pct": percentage(always_alive, total),
             "churned": churned,
             "churned_pct": percentage(churned, total),
+            "churned_now": churned_now,
+            "churned_now_pct": percentage(churned_now, total),
             "last_cycle": dict(last_cycle) if last_cycle else None,
             "pinger_running": status["running"],
+            "demo": DEMO_MODE,
         }
     )
 
@@ -267,7 +340,6 @@ def summary():
 @app.get("/api/cycles")
 def cycles():
     connection = connect_db(DB_FILE)
-    ensure_schema(connection)
     try:
         rows = connection.execute(
             """
@@ -295,7 +367,6 @@ def url_table(
         direction = "asc"
 
     connection = connect_db(DB_FILE)
-    ensure_schema(connection)
     try:
         where = ""
         params = []
@@ -320,17 +391,33 @@ def url_table(
             params + [page_size, (page - 1) * page_size],
         ).fetchall()
 
+        # Only this page's URLs need a current status, and only their newest
+        # completed-cycle ping. The ordering key matches the old Python-side
+        # "first row wins" pass, so ids out of step with cycle time still
+        # resolve the same way.
         last_status = {}
-        for row in connection.execute(
-            """
-            SELECT p.url, p.status
-            FROM pings p
-            JOIN cycles c ON c.cycle_id = p.cycle_id
-            WHERE c.status='completed'
-            ORDER BY datetime(c.started_at) DESC, p.id DESC
-            """
-        ).fetchall():
-            last_status.setdefault(row["url"], row["status"])
+        page_urls = [row["url"] for row in rows]
+        if page_urls:
+            placeholders = ",".join("?" * len(page_urls))
+            last_status = {
+                row["url"]: row["status"]
+                for row in connection.execute(
+                    f"""
+                    SELECT url, status FROM (
+                        SELECT p.url, p.status,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY p.url
+                                   ORDER BY datetime(c.started_at) DESC, p.id DESC
+                               ) AS rn
+                        FROM pings p
+                        JOIN cycles c ON c.cycle_id = p.cycle_id
+                        WHERE c.status='completed' AND p.url IN ({placeholders})
+                    )
+                    WHERE rn = 1
+                    """,
+                    page_urls,
+                ).fetchall()
+            }
     finally:
         connection.close()
 
@@ -369,6 +456,27 @@ def pinger_status():
 
 @app.post("/api/pinger/start")
 def pinger_start():
+    if DEMO_MODE and not pinger_manager.simulate:
+        return JSONResponse(
+            {
+                "started": False,
+                "error": "serving synthetic demo data read-only; a live pinger "
+                         "would write real results into the demo database",
+                **pinger_manager.status(),
+            },
+            status_code=409,
+        )
+    blocker = conflicting_pinger(pinger_manager.db_path)
+    if blocker:
+        return JSONResponse(
+            {
+                "started": False,
+                "error": f"another pinger is already writing "
+                         f"{pinger_manager.db_path}: {blocker}",
+                **pinger_manager.status(),
+            },
+            status_code=409,
+        )
     ok = pinger_manager.start()
     return JSONResponse({"started": ok, **pinger_manager.status()})
 
@@ -427,11 +535,49 @@ def run_report_cli():
     report_module.report(DB_FILE)
 
 
-def start_server(port=8000, no_pinger=False, interval=DEFAULT_INTERVAL):
+def run_demo_cli(cycles=12, urls=DEFAULT_URL_COUNT):
+    global DB_FILE
+    DB_FILE = DEMO_DB_FILE
+    result = seed_demo(DB_FILE, cycles=cycles, url_count=urls)
+    logging.info(
+        "Demo database ready: %(urls)d URLs, %(completed_cycles)d completed cycles, "
+        "%(aborted_cycles)d gap",
+        result,
+    )
+    report_module.report(DB_FILE)
+
+
+def start_server(port=8000, no_pinger=False, interval=DEFAULT_INTERVAL, demo=False,
+                 db=None):
     import uvicorn
 
+    global DEMO_MODE, DB_FILE
+    if db:
+        DB_FILE = db
+    if demo:
+        # Demo cycles are fabricated; keep them off the real collection DB.
+        DB_FILE = DEMO_DB_FILE
+    # Anything served out of the demo database is synthetic, however we got here.
+    DEMO_MODE = demo or Path(DB_FILE).name == DEMO_DB_FILE
+    # The pinger must follow the served database, never the default, or it would
+    # write to onions.db while the dashboard reads something else.
+    pinger_manager.db_path = Path(DB_FILE)
     pinger_manager.interval = interval
+    pinger_manager.simulate = demo
+    init_db(DB_FILE)
+    if demo:
+        seeded = ensure_demo_data(DB_FILE)
+        if seeded:
+            logging.info("Seeded demo history: %s", seeded)
     if not no_pinger:
+        blocker = conflicting_pinger(DB_FILE)
+        if blocker:
+            raise SystemExit(
+                f"Refusing to start a background pinger: another pinger is already "
+                f"writing {DB_FILE}, and two writers corrupt the run.\n  {blocker}\n"
+                f"Serve read-only with:  python app.py server --no-pinger"
+                + (f" --db {db}" if db else "")
+            )
         pinger_manager.start()
     try:
         uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
@@ -454,10 +600,23 @@ def parse_args():
 
     sub.add_parser("report", help="Print the churn report to the terminal")
 
+    demo_parser = sub.add_parser("demo", help="Seed realistic demo churn data")
+    demo_parser.add_argument("--cycles", type=int, default=12)
+    demo_parser.add_argument("--urls", type=int, default=DEFAULT_URL_COUNT)
+
     server_parser = sub.add_parser("server", help="Start the web UI (default)")
     server_parser.add_argument("--port", type=int, default=8000)
     server_parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
+    server_parser.add_argument(
+        "--db", default=None,
+        help=f"database to serve (default: {DB_FILE})",
+    )
     server_parser.add_argument("--no-pinger", action="store_true")
+    server_parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Seed demo data and append fast simulated cycles",
+    )
     return parser.parse_args()
 
 
@@ -483,6 +642,12 @@ def main():
         run_report_cli()
         return
 
+    if args.command == "demo":
+        if args.cycles < 3:
+            raise SystemExit("--cycles must be at least 3")
+        run_demo_cli(cycles=args.cycles, urls=args.urls)
+        return
+
     # default: server
     interval = getattr(args, "interval", DEFAULT_INTERVAL)
     if interval <= 0:
@@ -491,75 +656,171 @@ def main():
         port=getattr(args, "port", 8000),
         no_pinger=getattr(args, "no_pinger", False),
         interval=interval,
+        demo=getattr(args, "demo", False),
+        db=getattr(args, "db", None),
     )
 
+
+# Not dismissible by design: no control, and re-rendered on every request.
+_SYNTHETIC_BANNER = (
+    '<div class="synthetic-banner" role="alert">DEMO DATA — SYNTHETIC</div>'
+)
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <meta charset="utf-8">
 <title>Onion Churn Tracker</title>
 <style>
+:root {
+  --ink: #111;
+  --muted: #666;
+  --rule: #e3e3e3;
+  --accent: #a63224;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
 * { box-sizing: border-box; }
-body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background:#f5f7fa; color:#111; }
-header { background:#0b3d62; color:#fff; padding:12px 20px; }
-header h1 { margin:0; font-size:1.25rem; }
-.bar { display:flex; gap:10px; align-items:center; padding:10px 20px; background:#fff; border-bottom:1px solid #ddd; }
-button { border:1px solid #9bb1c8; background:#fff; border-radius:6px; padding:6px 12px; cursor:pointer; }
-button.active { background:#0b3d62; color:#fff; border-color:#0b3d62; }
-button:disabled { opacity:.6; cursor:not-allowed; }
-.grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(170px,1fr)); gap:12px; padding:12px 20px; }
-.tile { background:#fff; border:1px solid #ddd; border-radius:8px; padding:12px 16px; }
-.tile .v { font-size:1.75rem; font-weight:700; }
-.tile .l { font-size:.85rem; color:#444; margin-top:2px; }
-.tile .p { font-size:.8rem; color:#2f7d32; }
-.section { padding:0 20px 20px; }
-h2 { font-size:1rem; margin:0 0 8px; color:#0b3d62; }
-.chart-card, .table-card { background:#fff; border:1px solid #ddd; border-radius:8px; padding:12px 16px; margin-bottom:16px; }
-canvas { width:100%; height:260px; display:block; }
-table { width:100%; border-collapse:collapse; font-size:.85rem; }
-th, td { border-bottom:1px solid #e5e5e5; text-align:left; padding:6px 8px; }
-th { background:#f0f4f8; cursor:pointer; }
-tr:hover { background:#f7fafc; }
-.pagination { display:flex; gap:6px; align-items:center; margin-top:8px; }
-.pagination button { min-width:32px; }
-.muted { color:#666; font-size:.85rem; }
-.ok { color:#2f7d32; } .bad { color:#b3261e; } .gap { color:#b36b00; }
-.status-badge { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
-.status-ok { background:#2f7d32; } .status-dead { background:#b3261e; } .status-unknown { background:#999; }
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  margin: 0; background: #fff; color: var(--ink);
+  font-size: 13px; line-height: 1.45;
+}
+.figure { font-variant-numeric: tabular-nums; }
+header {
+  display: flex; align-items: baseline; gap: 16px;
+  padding: 14px 24px 12px; border-bottom: 1px solid var(--rule);
+}
+header h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: .01em; }
+header .meta {
+  margin-left: auto; font-size: 11px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+header .meta b { font-weight: 500; color: var(--ink); }
+.synthetic-banner {
+  position: sticky; top: 0; z-index: 20;
+  background: var(--accent); color: #fff;
+  font-size: 11px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase;
+  text-align: center; padding: 7px 24px;
+  border-bottom: 1px solid var(--accent);
+}
+button {
+  font: inherit; font-size: 11px; color: var(--ink);
+  background: #fff; border: 1px solid var(--rule); padding: 3px 9px; cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--muted); }
+button:disabled { color: #aaa; cursor: not-allowed; }
+button.active { border-color: var(--ink); }
+.controls { display: flex; align-items: center; gap: 8px; padding: 10px 24px; }
+.controls .spacer { margin-left: auto; }
+
+/* Tiles: one row, label above figure, hairline rules between. */
+.tiles { display: flex; padding: 0 24px; border-bottom: 1px solid var(--rule); }
+.tile { padding: 14px 24px 16px; flex: 0 0 auto; min-width: 128px; }
+.tile + .tile { border-left: 1px solid var(--rule); }
+.tile:first-child { padding-left: 0; }
+.tile .l {
+  font-size: 10px; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--muted); margin-bottom: 4px; white-space: nowrap;
+}
+.tile .v {
+  font-size: 30px; font-weight: 400; letter-spacing: -.01em; line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+
+section { padding: 18px 24px 24px; }
+section + section { border-top: 1px solid var(--rule); }
+h2 {
+  font-size: 11px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--muted); margin: 0 0 10px; display: flex; align-items: center; gap: 10px;
+}
+canvas { width: 100%; height: 280px; display: block; }
+
+table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+th {
+  text-align: left; font-size: 10px; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--muted);
+  padding: 0 10px 6px 0; border-bottom: 1px solid var(--rule); cursor: pointer;
+  white-space: nowrap;
+}
+th:hover { color: var(--ink); }
+td {
+  padding: 5px 10px 5px 0; border-bottom: 1px solid var(--rule);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+td.u { font-family: var(--mono); font-size: 11px; }
+td.u a { color: var(--ink); text-decoration: none; }
+td.u a:hover { text-decoration: underline; }
+th.n, td.n { text-align: right; font-variant-numeric: tabular-nums; }
+.dot { display: inline-block; width: 6px; height: 6px; margin-right: 6px; vertical-align: 1px; }
+.dot.alive { background: var(--accent); }
+.dot.dead { background: #c9c9c9; }
+.dot.unknown { background: #fff; border: 1px solid #c9c9c9; }
+.tbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+input[type=text] {
+  font: inherit; font-size: 11px; font-family: var(--mono);
+  border: 1px solid var(--rule); padding: 4px 8px; width: 300px; color: var(--ink);
+}
+input[type=text]:focus { outline: none; border-color: var(--muted); }
+.note { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pager { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
 </style>
 <body>
-<header><h1>\u26ab Onion Churn Tracker</h1></header>
-<div class="bar">
-  <div id="pinger-status" class="muted">Pinger: <span id="pinger-running">stopped</span></div>
+<!--BANNER-->
+<header>
+  <h1>Onion Churn Tracker</h1>
+  <div class="meta">
+    database <b id="db-name"><!--DBNAME--></b> &nbsp;·&nbsp; pinger <b id="pinger-running">stopped</b>
+    &nbsp;·&nbsp; <span id="last-cycle">—</span>
+  </div>
+</header>
+
+<div class="tiles figure" id="tiles"></div>
+
+<div class="controls">
   <button id="btn-start" onclick="togglePinger()">Start pinger</button>
   <button id="btn-stop" onclick="togglePinger()" disabled>Stop pinger</button>
-  <span class="muted" style="margin-left:auto">DB: onions.db &bull; <a href="/api/summary">JSON</a> &bull; <a href="/api/cycles">cycles</a></span>
+  <span class="spacer note"><a href="/api/summary">summary</a> · <a href="/api/cycles">cycles</a></span>
 </div>
-<div class="grid" id="tiles"></div>
-<div class="section">
-  <h2>Alive over time</h2>
-  <div class="chart-card"><canvas id="chart"></canvas></div>
-</div>
-<div class="section">
-  <h2>URL table</h2>
-  <div class="table-card">
-    <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
-      <input id="search" placeholder="Filter URLs" style="padding:6px 10px;border:1px solid #ccc;border-radius:6px;width:260px;">
-      <span class="muted">Page <span id="page-info">1</span> of <span id="page-total">1</span></span>
-      <span class="muted" style="margin-left:auto">Sort: <span id="sort-info">url</span></span>
-    </div>
-    <table id="url-table">
-      <thead><tr><th onclick="sort('url')">URL</th><th onclick="sort('first_seen')">First seen</th><th onclick="sort('last_alive')">Last alive</th><th onclick="sort('uptime')">Uptime %</th><th onclick="sort('total_pings')">Pings</th><th>Current</th></tr></thead>
-      <tbody id="url-body"></tbody>
-    </table>
-    <div class="pagination">
-      <button id="btn-prev" onclick="changePage(-1)">Prev</button>
-      <button id="btn-next" onclick="changePage(1)">Next</button>
-    </div>
+
+<section>
+  <h2>Services alive per cycle
+    <button id="btn-window" onclick="toggleWindow()">all history</button>
+  </h2>
+  <canvas id="chart"></canvas>
+</section>
+
+<section>
+  <h2>Services</h2>
+  <div class="tbar">
+    <input type="text" id="search" placeholder="filter by address" spellcheck="false">
+    <span class="note">page <span id="page-info">1</span> / <span id="page-total">1</span></span>
+    <span class="note spacer">sorted by <span id="sort-info">url</span></span>
   </div>
-</div>
+  <table>
+    <colgroup>
+      <col><col style="width:150px"><col style="width:150px">
+      <col style="width:84px"><col style="width:84px"><col style="width:96px">
+    </colgroup>
+    <thead><tr>
+      <th onclick="sort('url')">Address</th>
+      <th onclick="sort('first_seen')">First seen</th>
+      <th onclick="sort('last_alive')">Last alive</th>
+      <th class="n" onclick="sort('uptime')">Uptime</th>
+      <th class="n" onclick="sort('total_pings')">Pings</th>
+      <th>Status</th>
+    </tr></thead>
+    <tbody id="url-body"></tbody>
+  </table>
+  <div class="pager">
+    <button id="btn-prev" onclick="changePage(-1)">Prev</button>
+    <button id="btn-next" onclick="changePage(1)">Next</button>
+  </div>
+</section>
+
 <script>
-let state = { page:1, pageSize:50, search:'', sort:'url', dir:'asc', totalPages:1 };
+const INK = '#111', MUTED = '#666', RULE = '#e3e3e3', ACCENT = '#a63224';
+const MONO = '10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+let state = { page:1, pageSize:50, search:'', sort:'url', dir:'asc', totalPages:1, chartAll:false };
 const runningSpan = document.getElementById('pinger-running');
 const btnStart = document.getElementById('btn-start');
 const btnStop = document.getElementById('btn-stop');
@@ -567,23 +828,29 @@ const btnStop = document.getElementById('btn-stop');
 async function load(){
   await Promise.all([loadSummary(), loadCycles(), loadUrls(), loadPinger()]);
 }
+
+function pad2(n){ return String(n).padStart(2, '0'); }
+function stamp(iso){
+  const d = new Date(iso);
+  if(isNaN(d)) return iso || '—';
+  return `${MONTHS[d.getMonth()]} ${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
 async function loadSummary(){
   const r = await fetch('/api/summary'); const d = await r.json();
-  const tiles = document.getElementById('tiles');
-  tiles.innerHTML = `
-    <div class="tile"><div class="v">${d.total}</div><div class="l">Total discovered</div></div>
-    <div class="tile"><div class="v">${d.current_alive}</div><div class="l">Currently alive</div></div>
-    <div class="tile"><div class="v ok">${d.ever_alive}</div><div class="l">Ever alive <span class="p">(${d.ever_alive_pct.toFixed(1)}%)</span></div></div>
-    <div class="tile"><div class="v bad">${d.never_alive}</div><div class="l">Never responded <span class="p">(${d.never_alive_pct.toFixed(1)}%)</span></div></div>
-    <div class="tile"><div class="v ok">${d.always_alive}</div><div class="l">Consistently alive <span class="p">(${d.always_alive_pct.toFixed(1)}%)</span></div></div>
-    <div class="tile"><div class="v bad">${d.churned}</div><div class="l">Churned <span class="p">(${d.churned_pct.toFixed(1)}%)</span></div></div>
-    <div class="tile"><div class="v">${d.completed_cycles}</div><div class="l">Completed cycles</div><div class="p gap">${d.aborted_cycles} aborted gaps</div></div>
+  document.getElementById('tiles').innerHTML = `
+    <div class="tile"><div class="l">Services tracked</div><div class="v">${d.total}</div></div>
+    <div class="tile"><div class="l">Alive in last cycle</div><div class="v">${d.current_alive}</div></div>
+    <div class="tile"><div class="l">Never responded</div><div class="v">${d.never_alive}</div></div>
+    <div class="tile"><div class="l">Churned</div><div class="v">${d.churned_now}</div></div>
+    <div class="tile"><div class="l">Completed cycles</div><div class="v">${d.completed_cycles}</div></div>
   `;
-  if(d.last_cycle){
-    const cls = d.last_cycle.status === 'completed' ? 'ok' : (d.last_cycle.status === 'aborted' ? 'gap' : 'bad');
-    tiles.innerHTML += `<div class="tile"><div class="v ${cls}">${d.last_cycle.alive}/${d.last_cycle.total}</div><div class="l">Last cycle ${d.last_cycle.status}</div><div class="muted">${d.last_cycle.started_at}</div></div>`;
-  }
+  const lc = document.getElementById('last-cycle');
+  lc.textContent = d.last_cycle
+    ? `last cycle ${stamp(d.last_cycle.started_at)} ${d.last_cycle.status}`
+    : 'no cycles yet';
 }
+
 async function loadCycles(){
   const r = await fetch('/api/cycles'); const cycles = await r.json();
   const canvas = document.getElementById('chart'); const ctx = canvas.getContext('2d');
@@ -591,103 +858,197 @@ async function loadCycles(){
   const rect = canvas.getBoundingClientRect();
   canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
   ctx.scale(dpr, dpr);
-  const w = rect.width, h = rect.height, pad = 36;
-  ctx.clearRect(0,0,w,h);
-  if(!cycles.length){ ctx.fillStyle='#999'; ctx.font='14px system-ui'; ctx.fillText('No cycles yet', pad, h/2); return; }
-  const completed = cycles.filter(c=>c.status==='completed');
-  const maxAlive = Math.max(...completed.map(c=>c.alive), 1);
-  const xScale = (i) => pad + (i/(Math.max(cycles.length-1,1)))*(w-2*pad);
-  const yScale = (v) => h - pad - (v/maxAlive)*(h-2*pad);
-  ctx.strokeStyle='#0b3d62'; ctx.lineWidth=2; ctx.beginPath();
-  let inSegment=false;
-  cycles.forEach((c,i)=>{
-    const x=xScale(i);
-    if(c.status==='completed'){
-      const y=yScale(c.alive);
-      if(!inSegment){ctx.moveTo(x,y); inSegment=true;} else ctx.lineTo(x,y);
+  const w = rect.width, h = rect.height;
+  const padL = 54, padR = 14, padT = 14, padB = 34;
+  ctx.clearRect(0, 0, w, h);
+  const message = (text) => { ctx.fillStyle = MUTED; ctx.font = MONO; ctx.fillText(text, padL, h/2); };
+  if(!cycles.length){ message('no cycles yet'); return; }
+
+  const startedAt = (c) => Date.parse(c.started_at);
+  const completedAll = cycles.filter(c => c.status === 'completed');
+  // Default window: completed cycles only. A long run of aborted cycles then
+  // collapses into one break instead of eating most of the x-axis.
+  const series = state.chartAll ? cycles : completedAll;
+  if(!series.length){ message('no completed cycles yet'); return; }
+
+  // Median gap over completed cycles, used to spot unobserved stretches.
+  const deltas = [];
+  for(let k = 1; k < completedAll.length; k++) deltas.push(startedAt(completedAll[k]) - startedAt(completedAll[k-1]));
+  const ranked = deltas.filter(d => d > 0).sort((a,b) => a - b);
+  const median = ranked.length
+    ? (ranked.length % 2 ? ranked[(ranked.length-1)/2] : (ranked[ranked.length/2-1] + ranked[ranked.length/2]) / 2)
+    : 0;
+  const fmtGap = (ms) => ms >= 86400000 ? `${Math.round(ms/86400000)}d gap` : `${Math.round(ms/3600000)}h gap`;
+  // A break before series[k]: either an aborted cycle fell in between, or the
+  // wait was far longer than usual. Either way it is unobserved time.
+  const breaks = new Map();
+  for(let k = 1; k < series.length; k++){
+    if(series[k].status !== 'completed' || series[k-1].status !== 'completed') continue;
+    const gap = startedAt(series[k]) - startedAt(series[k-1]);
+    const abortedBetween = cycles.some(c => c.status !== 'completed'
+      && startedAt(c) > startedAt(series[k-1]) && startedAt(c) < startedAt(series[k]));
+    if(abortedBetween || (median > 0 && gap > 3*median)) breaks.set(k, fmtGap(gap));
+  }
+
+  // Y scale rounded up to a readable tick step.
+  const peak = Math.max(...completedAll.map(c => c.alive), 1);
+  const pow = Math.pow(10, Math.floor(Math.log10(peak)));
+  const unit = peak/pow <= 1 ? 1 : peak/pow <= 2 ? 2 : peak/pow <= 5 ? 5 : 10;
+  const yMax = unit * pow;
+  const ticks = unit === 1 ? 4 : unit === 2 ? 4 : 5;
+  const xScale = (i) => padL + (i / Math.max(series.length - 1, 1)) * (w - padL - padR);
+  const yScale = (v) => h - padB - (v / yMax) * (h - padT - padB);
+
+  // Gridlines and y labels.
+  ctx.font = MONO; ctx.textBaseline = 'middle';
+  for(let t = 0; t <= ticks; t++){
+    const v = yMax * t / ticks, y = Math.round(yScale(v)) + 0.5;
+    ctx.strokeStyle = RULE; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+    ctx.fillStyle = MUTED; ctx.textAlign = 'right';
+    ctx.fillText(String(Math.round(v)), padL - 8, y);
+  }
+  ctx.save();
+  ctx.translate(12, (padT + h - padB) / 2); ctx.rotate(-Math.PI/2);
+  ctx.textAlign = 'center'; ctx.fillStyle = MUTED; ctx.fillText('services alive', 0, 0);
+  ctx.restore();
+  ctx.textBaseline = 'alphabetic';
+
+  const breakMarks = [];
+  const drawBreak = (x) => {
+    ctx.save();
+    ctx.strokeStyle = '#bbb'; ctx.setLineDash([3,3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(Math.round(x) + 0.5, padT); ctx.lineTo(Math.round(x) + 0.5, h - padB); ctx.stroke();
+    ctx.restore();
+    ctx.beginPath();
+  };
+
+  // Data line: 1px, single accent, broken at every unobserved stretch.
+  ctx.strokeStyle = ACCENT; ctx.lineWidth = 1; ctx.beginPath();
+  let inSegment = false;
+  series.forEach((c, i) => {
+    const x = xScale(i);
+    if(c.status === 'completed'){
+      if(inSegment && breaks.has(i)){
+        ctx.stroke(); inSegment = false;
+        const mid = (x + xScale(i-1)) / 2;
+        drawBreak(mid);
+        breakMarks.push({ x: mid, label: breaks.get(i) });
+      }
+      const y = yScale(c.alive);
+      if(!inSegment){ ctx.moveTo(x, y); inSegment = true; } else ctx.lineTo(x, y);
     } else {
-      if(inSegment){ctx.stroke(); ctx.beginPath(); inSegment=false;}
-      ctx.strokeStyle='#b36b00'; ctx.setLineDash([6,4]); ctx.beginPath(); ctx.moveTo(x,pad); ctx.lineTo(x,h-pad); ctx.stroke(); ctx.setLineDash([]);
-      ctx.beginPath();
-      ctx.strokeStyle='#0b3d62';
+      if(inSegment){ ctx.stroke(); inSegment = false; }
+      drawBreak(x);
     }
   });
   if(inSegment) ctx.stroke();
-  cycles.forEach((c,i)=>{
-    const x=xScale(i);
-    if(c.status==='completed'){
-      const y=yScale(c.alive);
-      ctx.fillStyle='#0b3d62'; ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill();
-    } else {
-      ctx.fillStyle='#b36b00'; ctx.font='11px system-ui'; ctx.fillText('gap', x+4, pad+12);
-    }
+
+  series.forEach((c, i) => {
+    if(c.status !== 'completed') return;
+    ctx.fillStyle = ACCENT;
+    ctx.beginPath(); ctx.arc(xScale(i), yScale(c.alive), 1.75, 0, Math.PI*2); ctx.fill();
   });
-  ctx.strokeStyle='#ccc'; ctx.beginPath(); ctx.moveTo(pad,h-pad); ctx.lineTo(w-pad,h-pad); ctx.stroke();
-  ctx.fillStyle='#666'; ctx.font='12px system-ui';
-  cycles.forEach((c,i)=>{ if(i%Math.max(1,Math.floor(cycles.length/8))===0){ ctx.fillText(c.started_at.slice(0,16), xScale(i)-30, h-8); } });
+
+  ctx.font = MONO; ctx.fillStyle = MUTED; ctx.textAlign = 'left';
+  breakMarks.forEach(m => ctx.fillText(m.label, m.x + 4, padT + 10));
+
+  // X axis with date ticks spaced so labels cannot collide.
+  const axisY = Math.round(h - padB) + 0.5;
+  ctx.strokeStyle = RULE; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(padL, axisY); ctx.lineTo(w - padR, axisY); ctx.stroke();
+  const maxTicks = Math.max(2, Math.floor((w - padL - padR) / 92));
+  const step = Math.max(1, Math.ceil(series.length / maxTicks));
+  ctx.fillStyle = MUTED; ctx.textAlign = 'center';
+  for(let i = 0; i < series.length; i += step){
+    const x = Math.min(Math.max(xScale(i), padL + 26), w - padR - 26);
+    ctx.fillText(stamp(series[i].started_at), x, h - padB + 15);
+  }
+  if(!state.chartAll && completedAll.length < cycles.length){
+    ctx.textAlign = 'right';
+    ctx.fillText(`${cycles.length - completedAll.length} aborted cycles hidden`, w - padR, h - 6);
+  }
 }
+
 async function loadUrls(){
   const r = await fetch(`/api/urls?page=${state.page}&page_size=${state.pageSize}&search=${encodeURIComponent(state.search)}&sort=${state.sort}&direction=${state.dir}`);
   const d = await r.json();
   const body = document.getElementById('url-body'); body.replaceChildren();
   for(const it of d.items){
-    const cls = it.current_status==='alive'?'status-ok':(it.current_status==='dead'?'status-dead':'status-unknown');
-    const label = it.current_status==='alive'?'alive':(it.current_status==='dead'?'dead':'unknown');
     const row = document.createElement('tr');
+
     const urlCell = document.createElement('td');
+    urlCell.className = 'u';
+    urlCell.title = it.url;
     const separator = it.url.indexOf('://');
     const scheme = it.url.slice(0, separator).toLowerCase();
     const remainder = separator < 0 ? '' : it.url.slice(separator + 3);
     const authority = remainder.split('/', 1)[0].split('?', 1)[0].split('#', 1)[0];
     const hostname = authority.split(':', 1)[0].toLowerCase();
-    const validOnion = (scheme==='http' || scheme==='https') && /^[a-z2-7]{56}[.]onion$/i.test(hostname);
+    const validOnion = (scheme === 'http' || scheme === 'https') && /^[a-z2-7]{56}[.]onion$/i.test(hostname);
     if(validOnion){
       const link = document.createElement('a');
-      link.href = it.url;
-      link.target = '_blank';
-      link.rel = 'noopener';
+      link.href = it.url; link.target = '_blank'; link.rel = 'noopener';
       link.textContent = it.url;
       urlCell.append(link);
     } else {
       urlCell.textContent = it.url;
     }
+
     const firstSeen = document.createElement('td');
-    firstSeen.textContent = it.first_seen || '';
+    firstSeen.textContent = stamp(it.first_seen);
+    firstSeen.title = it.first_seen || '';
     const lastAlive = document.createElement('td');
-    lastAlive.textContent = it.last_alive || '—';
+    lastAlive.textContent = it.last_alive ? stamp(it.last_alive) : '—';
+    lastAlive.title = it.last_alive || '';
     const uptime = document.createElement('td');
-    uptime.textContent = it.uptime_pct.toFixed(1);
+    uptime.className = 'n';
+    uptime.textContent = it.total_pings ? it.uptime_pct.toFixed(1) + '%' : '—';
     const pings = document.createElement('td');
+    pings.className = 'n';
     pings.textContent = `${it.alive_pings}/${it.total_pings}`;
+
     const current = document.createElement('td');
-    const badge = document.createElement('span');
-    badge.className = `status-badge ${cls}`;
-    current.append(badge, document.createTextNode(label));
+    const dot = document.createElement('span');
+    dot.className = 'dot ' + (it.current_status === 'alive' ? 'alive'
+      : it.current_status === 'dead' ? 'dead' : 'unknown');
+    current.append(dot, document.createTextNode(it.current_status));
+
     row.append(urlCell, firstSeen, lastAlive, uptime, pings, current);
     body.append(row);
   }
   state.totalPages = d.total_pages;
   document.getElementById('page-info').textContent = state.page;
-  document.getElementById('page-total').textContent = state.total_pages;
-  document.getElementById('btn-prev').disabled = state.page<=1;
-  document.getElementById('btn-next').disabled = state.page>=state.total_pages;
-  document.getElementById('sort-info').textContent = state.sort + (state.dir==='desc'?' \u25bc':' \u25b2');
+  document.getElementById('page-total').textContent = state.totalPages;
+  document.getElementById('btn-prev').disabled = state.page <= 1;
+  document.getElementById('btn-next').disabled = state.page >= state.totalPages;
+  document.getElementById('sort-info').textContent = state.sort + (state.dir === 'desc' ? ' desc' : ' asc');
 }
+
 async function loadPinger(){
   const r = await fetch('/api/pinger/status'); const d = await r.json();
-  runningSpan.textContent = d.running ? 'running' : 'stopped';
-  runningSpan.className = d.running ? 'ok' : 'bad';
-  btnStart.disabled = d.running; btnStop.disabled = !d.running;
+  runningSpan.textContent = d.locked ? 'read-only' : (d.running ? 'running' : 'stopped');
+  btnStart.disabled = d.locked || d.running;
+  btnStop.disabled = d.locked || !d.running;
+  if(d.locked){ btnStart.title = btnStop.title = 'disabled while serving synthetic demo data'; }
 }
 async function togglePinger(){
-  const r = await fetch('/api/pinger/' + (pingerRunning()?'stop':'start'), {method:'POST'});
+  const r = await fetch('/api/pinger/' + (pingerRunning() ? 'stop' : 'start'), { method:'POST' });
   await r.json(); await loadPinger();
 }
 function pingerRunning(){ return runningSpan.textContent === 'running'; }
+function toggleWindow(){
+  state.chartAll = !state.chartAll;
+  const b = document.getElementById('btn-window');
+  b.textContent = state.chartAll ? 'completed only' : 'all history';
+  b.classList.toggle('active', state.chartAll);
+  loadCycles();
+}
 function changePage(delta){ state.page = Math.min(Math.max(1, state.page + delta), state.totalPages); loadUrls(); }
-function sort(col){ if(state.sort===col) state.dir = state.dir==='asc'?'desc':'asc'; else {state.sort=col; state.dir='asc';} state.page=1; loadUrls(); }
-document.getElementById('search').addEventListener('input', (e)=>{ state.search=e.target.value; state.page=1; loadUrls(); });
-setInterval(()=>{ loadSummary(); loadCycles(); loadUrls(); loadPinger(); }, 8000);
+function sort(col){ if(state.sort === col) state.dir = state.dir === 'asc' ? 'desc' : 'asc'; else { state.sort = col; state.dir = 'asc'; } state.page = 1; loadUrls(); }
+document.getElementById('search').addEventListener('input', (e) => { state.search = e.target.value; state.page = 1; loadUrls(); });
+window.addEventListener('resize', () => loadCycles());
+setInterval(() => { loadSummary(); loadCycles(); loadUrls(); loadPinger(); }, 8000);
 load();
 </script>
 </body>
