@@ -6,3 +6,13 @@ venv/
 # Default generated crawl output
 links.txt
 edges.json
+
+# SQLite runtime files and demo backups
+onions.db-wal
+onions.db-shm
+onions.db-journal
+onions.db.bak-*
+onions.db
+onions_demo.db
+onions.db.bak-*
+onions-final-*.db
