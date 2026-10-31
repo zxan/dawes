@@ -15,3 +15,76 @@
 2026-10-31 03:36:29,085 INFO Cycle 12: 500/533 complete
 2026-10-31 03:37:58,458 INFO Cycle 12 completed: 175 alive / 358 dead
 2026-10-31 03:37:58,459 INFO Next cycle in 900 seconds
+2026-10-31 03:53:00,668 INFO Tor ready (exit IP 185.220.101.28)
+2026-10-31 03:57:03,776 INFO Cycle 13: 100/533 complete
+2026-10-31 04:00:47,827 INFO Cycle 13: 200/533 complete
+2026-10-31 04:03:58,288 INFO Cycle 13: 300/533 complete
+2026-10-31 04:07:41,295 INFO Cycle 13: 400/533 complete
+2026-10-31 04:10:55,294 INFO Cycle 13: 500/533 complete
+2026-10-31 04:12:14,508 INFO Cycle 13 completed: 235 alive / 298 dead
+2026-10-31 04:12:14,509 INFO Next cycle in 900 seconds
+2026-10-31 04:27:17,486 INFO Tor ready (exit IP 171.25.193.82)
+2026-10-31 04:30:28,751 INFO Cycle 14: 100/533 complete
+2026-10-31 04:33:56,813 INFO Cycle 14: 200/533 complete
+2026-10-31 04:37:02,368 INFO Cycle 14: 300/533 complete
+2026-10-31 04:40:23,518 INFO Cycle 14: 400/533 complete
+2026-10-31 04:45:13,526 INFO Cycle 14: 500/533 complete
+2026-10-31 04:47:28,464 INFO Cycle 14 completed: 198 alive / 335 dead
+2026-10-31 04:47:28,465 INFO Next cycle in 900 seconds
+2026-10-31 05:02:48,488 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be2490>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 05:02:48,489 ERROR Cycle 15 aborted before pinging
+2026-10-31 05:02:48,489 INFO Next cycle in 900 seconds
+2026-10-31 05:18:08,504 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be1e50>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 05:18:08,508 ERROR Cycle 16 aborted before pinging
+2026-10-31 05:18:08,509 INFO Next cycle in 900 seconds
+2026-10-31 05:33:28,549 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be2710>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 05:33:28,553 ERROR Cycle 17 aborted before pinging
+2026-10-31 05:33:28,553 INFO Next cycle in 900 seconds
+2026-10-31 05:48:48,571 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be0e10>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 05:48:48,576 ERROR Cycle 18 aborted before pinging
+2026-10-31 05:48:48,576 INFO Next cycle in 900 seconds
+2026-10-31 06:04:08,620 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be2850>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 06:04:08,624 ERROR Cycle 19 aborted before pinging
+2026-10-31 06:04:08,624 INFO Next cycle in 900 seconds
+2026-10-31 06:19:28,659 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be25d0>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 06:19:28,680 ERROR Cycle 20 aborted before pinging
+2026-10-31 06:19:28,680 INFO Next cycle in 900 seconds
+2026-10-31 06:34:48,704 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be0f50>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 06:34:48,708 ERROR Cycle 21 aborted before pinging
+2026-10-31 06:34:48,708 INFO Next cycle in 900 seconds
+2026-10-31 06:50:08,734 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be0cd0>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 06:50:08,738 ERROR Cycle 22 aborted before pinging
+2026-10-31 06:50:08,739 INFO Next cycle in 900 seconds
+2026-10-31 07:05:28,778 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be1810>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 07:05:28,782 ERROR Cycle 23 aborted before pinging
+2026-10-31 07:05:28,782 INFO Next cycle in 900 seconds
+2026-10-31 07:20:48,826 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be1090>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 07:20:48,829 ERROR Cycle 24 aborted before pinging
+2026-10-31 07:20:48,829 INFO Next cycle in 900 seconds
+2026-10-31 07:36:08,873 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be1a90>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 07:36:08,877 ERROR Cycle 25 aborted before pinging
+2026-10-31 07:36:08,877 INFO Next cycle in 900 seconds
+2026-10-31 07:51:28,904 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be2210>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 07:51:28,908 ERROR Cycle 26 aborted before pinging
+2026-10-31 07:51:28,908 INFO Next cycle in 900 seconds
+2026-10-31 08:06:48,947 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be11d0>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 08:06:48,968 ERROR Cycle 27 aborted before pinging
+2026-10-31 08:06:48,968 INFO Next cycle in 900 seconds
+2026-10-31 08:22:09,004 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be11d0>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 08:22:09,008 ERROR Cycle 28 aborted before pinging
+2026-10-31 08:22:09,008 INFO Next cycle in 900 seconds
+2026-10-31 08:37:29,052 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be2210>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 08:37:29,057 ERROR Cycle 29 aborted before pinging
+2026-10-31 08:37:29,057 INFO Next cycle in 900 seconds
+2026-10-31 08:52:49,101 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be1a90>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 08:52:49,123 ERROR Cycle 30 aborted before pinging
+2026-10-31 08:52:49,123 INFO Next cycle in 900 seconds
+2026-10-31 09:08:09,141 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be1090>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 09:08:09,144 ERROR Cycle 31 aborted before pinging
+2026-10-31 09:08:09,145 INFO Next cycle in 900 seconds
+2026-10-31 09:23:29,170 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be1810>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 09:23:29,171 ERROR Cycle 32 aborted before pinging
+2026-10-31 09:23:29,171 INFO Next cycle in 900 seconds
+2026-10-31 09:38:49,216 INFO Tor health check failed: SOCKSHTTPSConnectionPool(host='check.torproject.org', port=443): Max retries exceeded with url: /api/ip (Caused by ConnectTimeoutError(<SOCKSHTTPSConnection(host='check.torproject.org', port=443) at 0x7f2f93be0cd0>, 'Connection to check.torproject.org timed out. (connect timeout=20)'))
+2026-10-31 09:38:49,237 ERROR Cycle 33 aborted before pinging
+2026-10-31 09:38:49,237 INFO Next cycle in 900 seconds
